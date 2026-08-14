@@ -1,5 +1,4 @@
 import io
-import os
 import time
 import zipfile
 import urllib.request
@@ -8,10 +7,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 import streamlit as st
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageOps
 
 st.set_page_config(
-    page_title="画像分割・AI高画質化",
+    page_title="画像分割・人物高画質化",
     page_icon="🖼️",
     layout="wide",
 )
@@ -27,28 +26,20 @@ PRESETS = {
     "カスタム": None,
 }
 
-QUALITY_MODES = {
-    "AI軽量・安定（FSRCNN x2 / おすすめ）": "fsrcnn",
-    "AI高品質（EDSR x2 / 遅め）": "edsr",
-    "従来方式（LANCZOS x2）": "lanczos",
+MODES = {
+    "人物・肌リアル（EDSR x2 + 質感復元 / おすすめ）": "skin_edsr",
+    "人物・肌リアル（軽量 x2 / 高速）": "skin_lanczos",
+    "EDSR x2のみ（比較用）": "edsr",
     "高画質化なし": "off",
 }
 
-MODEL_INFO = {
-    "fsrcnn": {
-        "name": "FSRCNN_x2.pb",
-        "url": "https://raw.githubusercontent.com/Saafke/FSRCNN_Tensorflow/master/models/FSRCNN_x2.pb",
-        "algo": "fsrcnn",
-        "scale": 2,
-        "tile_size": 520,
-    },
-    "edsr": {
-        "name": "EDSR_x2.pb",
-        "url": "https://raw.githubusercontent.com/Saafke/EDSR_Tensorflow/master/models/EDSR_x2.pb",
-        "algo": "edsr",
-        "scale": 2,
-        "tile_size": 220,
-    },
+EDSR_MODEL = {
+    "name": "EDSR_x2.pb",
+    "url": "https://raw.githubusercontent.com/Saafke/EDSR_Tensorflow/master/models/EDSR_x2.pb",
+    "algo": "edsr",
+    "scale": 2,
+    # Community Cloudのメモリを食い過ぎないよう小さめにタイル処理
+    "tile_size": 220,
 }
 
 
@@ -61,11 +52,9 @@ def open_uploaded_image(uploaded_file):
         rgba = image.convert("RGBA")
         bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
         bg.alpha_composite(rgba)
-        image = bg.convert("RGB")
-    else:
-        image = image.convert("RGB")
+        return bg.convert("RGB")
 
-    return image
+    return image.convert("RGB")
 
 
 def split_image(image, cols, rows, trim_px=0):
@@ -94,12 +83,12 @@ def download_file(url: str, dst: Path):
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(dst.suffix + ".part")
 
-    request = urllib.request.Request(
+    req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 Streamlit-Image-SR"},
+        headers={"User-Agent": "Mozilla/5.0 Streamlit-Skin-Enhancer"},
     )
 
-    with urllib.request.urlopen(request, timeout=90) as response, open(tmp, "wb") as out:
+    with urllib.request.urlopen(req, timeout=90) as response, open(tmp, "wb") as out:
         while True:
             chunk = response.read(1024 * 1024)
             if not chunk:
@@ -109,43 +98,38 @@ def download_file(url: str, dst: Path):
     tmp.replace(dst)
 
 
-def ensure_model(mode: str) -> Path:
-    info = MODEL_INFO[mode]
+def ensure_edsr_model():
     model_dir = Path("/tmp/streamlit_sr_models")
-    model_path = model_dir / info["name"]
+    model_path = model_dir / EDSR_MODEL["name"]
 
-    if not model_path.exists() or model_path.stat().st_size < 1000:
-        download_file(info["url"], model_path)
+    if not model_path.exists() or model_path.stat().st_size < 1_000_000:
+        download_file(EDSR_MODEL["url"], model_path)
 
     return model_path
 
 
 @st.cache_resource(show_spinner=False)
-def load_sr_model(mode: str):
-    info = MODEL_INFO[mode]
-    model_path = ensure_model(mode)
-
+def load_edsr():
     if not hasattr(cv2, "dnn_superres"):
         raise RuntimeError(
             "cv2.dnn_superres が見つかりません。requirements.txt で "
             "opencv-contrib-python-headless を使用してください。"
         )
 
+    model_path = ensure_edsr_model()
     sr = cv2.dnn_superres.DnnSuperResImpl_create()
     sr.readModel(str(model_path))
-    sr.setModel(info["algo"], info["scale"])
+    sr.setModel(EDSR_MODEL["algo"], EDSR_MODEL["scale"])
     return sr
 
 
-def tiled_super_resolution(bgr: np.ndarray, mode: str) -> np.ndarray:
-    info = MODEL_INFO[mode]
-    sr = load_sr_model(mode)
-    scale = info["scale"]
-    tile_size = info["tile_size"]
+def tiled_edsr(bgr: np.ndarray) -> np.ndarray:
+    sr = load_edsr()
+    scale = EDSR_MODEL["scale"]
+    tile_size = EDSR_MODEL["tile_size"]
 
     h, w = bgr.shape[:2]
 
-    # 小さめの画像はそのまま推論。大きい画像だけ分割してメモリ節約。
     if h <= tile_size and w <= tile_size:
         return sr.upsample(bgr)
 
@@ -166,7 +150,6 @@ def tiled_super_resolution(bgr: np.ndarray, mode: str) -> np.ndarray:
             tile = bgr[ey0:ey1, ex0:ex1]
             up = sr.upsample(tile)
 
-            # 重なり部分を捨てて、中央の本来のセルだけ貼る
             sx0 = (x0 - ex0) * scale
             sy0 = (y0 - ey0) * scale
             sx1 = sx0 + (x1 - x0) * scale
@@ -182,99 +165,239 @@ def tiled_super_resolution(bgr: np.ndarray, mode: str) -> np.ndarray:
     return output
 
 
-def subtle_finish(pil_image: Image.Image, strength: float = 0.18) -> Image.Image:
+def make_skin_mask(bgr: np.ndarray) -> np.ndarray:
     """
-    AI超解像後の輪郭だけほんの少し整える。
-    強いシャープ化は肌・髪・輪郭が不自然になるので避ける。
+    肌色の「候補」を柔らかく推定するだけのマスク。
+    顔認識はしないので、人物の顔立ちを作り直す処理は行わない。
     """
-    sharpened = pil_image.filter(
-        ImageFilter.UnsharpMask(radius=0.8, percent=65, threshold=4)
+    ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+
+    # かなり広めに取って、境界をぼかす。
+    lower = np.array([0, 128, 72], dtype=np.uint8)
+    upper = np.array([255, 183, 142], dtype=np.uint8)
+
+    mask = cv2.inRange(ycrcb, lower, upper)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=7.0, sigmaY=7.0)
+
+    mask_f = mask.astype(np.float32) / 255.0
+    # 0/1に切りすぎないよう、最大でも0.9程度の効きにする
+    return np.clip(mask_f * 0.9, 0.0, 0.9)
+
+
+def restore_skin_texture(
+    bgr: np.ndarray,
+    texture_strength: int = 45,
+    skin_smoothness: int = 14,
+    local_contrast: int = 18,
+) -> np.ndarray:
+    """
+    目的:
+    - 肌をのっぺりさせない
+    - 元画像に残っている微細な陰影を少し見えやすくする
+    - 色ノイズだけ軽く抑える
+    - 顔形状やパーツを生成し直さない
+
+    「毛穴をAI生成する」処理ではない。
+    元画像に残る高周波成分と局所コントラストを丁寧に持ち上げる。
+    """
+    bgr = bgr.copy()
+    skin_mask = make_skin_mask(bgr)
+    skin_mask_3 = skin_mask[..., None]
+
+    # 1) 輝度と色を分離。
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    l, a, bb = cv2.split(lab)
+
+    # 2) 色ムラだけをごく軽く整える。
+    #    輝度Lにはデノイズをかけず、肌の細かな陰影を残す。
+    smooth = max(0, min(30, skin_smoothness))
+    if smooth > 0:
+        sigma_color = 2.5 + smooth * 0.22
+        a_s = cv2.bilateralFilter(a, d=5, sigmaColor=sigma_color, sigmaSpace=5)
+        b_s = cv2.bilateralFilter(bb, d=5, sigmaColor=sigma_color, sigmaSpace=5)
+
+        a_f = a.astype(np.float32)
+        b_f = bb.astype(np.float32)
+        a_s = a_s.astype(np.float32)
+        b_s = b_s.astype(np.float32)
+
+        chroma_mix = np.clip(smooth / 30.0, 0.0, 1.0) * skin_mask
+        a = np.clip(a_f * (1 - chroma_mix) + a_s * chroma_mix, 0, 255).astype(np.uint8)
+        bb = np.clip(b_f * (1 - chroma_mix) + b_s * chroma_mix, 0, 255).astype(np.uint8)
+
+    # 3) 局所コントラストを弱く足す。
+    #    CLAHEをそのまま100%使うと肌が硬くなるのでブレンド。
+    lc = max(0, min(40, local_contrast))
+    if lc > 0:
+        clahe = cv2.createCLAHE(
+            clipLimit=1.05 + lc * 0.012,
+            tileGridSize=(8, 8),
+        )
+        l_clahe = clahe.apply(l)
+
+        mix = (lc / 40.0) * 0.28
+        l_f = l.astype(np.float32)
+        l_c = l_clahe.astype(np.float32)
+
+        # 肌は少し強め、背景はかなり弱め
+        local_mask = 0.18 + 0.82 * skin_mask
+        local_mix = mix * local_mask
+        l = np.clip(
+            l_f * (1 - local_mix) + l_c * local_mix,
+            0,
+            255,
+        ).astype(np.uint8)
+
+    # 4) 元々残っている微細ディテールを高周波成分として戻す。
+    strength = max(0, min(100, texture_strength)) / 100.0
+    if strength > 0:
+        l_f = l.astype(np.float32)
+        blur = cv2.GaussianBlur(l_f, (0, 0), sigmaX=1.15, sigmaY=1.15)
+        detail = l_f - blur
+
+        # 強いエッジのハローを抑えるため高周波を制限。
+        detail = np.clip(detail, -10.0, 10.0)
+
+        # 肌は最大0.62、背景は最大0.25程度。
+        amount = strength * (0.24 + 0.38 * skin_mask)
+
+        l = np.clip(l_f + detail * amount, 0, 255).astype(np.uint8)
+
+    out_lab = cv2.merge([l, a, bb])
+    out = cv2.cvtColor(out_lab, cv2.COLOR_LAB2BGR)
+
+    # 5) 元画像と軽くブレンドして「加工感」を抑える。
+    #    肌候補部分だけ処理をやや強く反映。
+    base = bgr.astype(np.float32)
+    processed = out.astype(np.float32)
+
+    final_mix = 0.38 + 0.52 * skin_mask_3
+    out = np.clip(
+        base * (1.0 - final_mix) + processed * final_mix,
+        0,
+        255,
+    ).astype(np.uint8)
+
+    return out
+
+
+def upscale_lanczos(bgr: np.ndarray) -> np.ndarray:
+    h, w = bgr.shape[:2]
+    return cv2.resize(
+        bgr,
+        (w * 2, h * 2),
+        interpolation=cv2.INTER_LANCZOS4,
     )
-    return Image.blend(pil_image, sharpened, strength)
 
 
-def enhance_image(image: Image.Image, mode: str, finish_sharpen: bool) -> Image.Image:
-    if mode == "off":
-        return image
-
-    if mode == "lanczos":
-        w, h = image.size
-        result = image.resize((w * 2, h * 2), Image.Resampling.LANCZOS)
-        if finish_sharpen:
-            result = subtle_finish(result, strength=0.28)
-        return result
-
+def process_piece(
+    image: Image.Image,
+    mode: str,
+    texture_strength: int,
+    skin_smoothness: int,
+    local_contrast: int,
+) -> Image.Image:
     rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-    upscaled_bgr = tiled_super_resolution(bgr, mode)
-    upscaled_rgb = cv2.cvtColor(upscaled_bgr, cv2.COLOR_BGR2RGB)
-    result = Image.fromarray(upscaled_rgb)
+    if mode == "off":
+        out = bgr
 
-    if finish_sharpen:
-        result = subtle_finish(result)
+    elif mode == "edsr":
+        out = tiled_edsr(bgr)
 
-    return result
+    elif mode == "skin_edsr":
+        out = tiled_edsr(bgr)
+        out = restore_skin_texture(
+            out,
+            texture_strength=texture_strength,
+            skin_smoothness=skin_smoothness,
+            local_contrast=local_contrast,
+        )
+
+    elif mode == "skin_lanczos":
+        out = upscale_lanczos(bgr)
+        out = restore_skin_texture(
+            out,
+            texture_strength=texture_strength,
+            skin_smoothness=skin_smoothness,
+            local_contrast=local_contrast,
+        )
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    rgb_out = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(rgb_out)
 
 
 def image_to_bytes(image, fmt, jpeg_quality=97):
-    buffer = io.BytesIO()
+    buf = io.BytesIO()
 
     if fmt == "JPEG":
         image.convert("RGB").save(
-            buffer,
+            buf,
             format="JPEG",
             quality=jpeg_quality,
             subsampling=0,
             optimize=True,
             progressive=True,
         )
-        return buffer.getvalue(), "image/jpeg", "jpg"
+        return buf.getvalue(), "image/jpeg", "jpg"
 
     image.save(
-        buffer,
+        buf,
         format="PNG",
         optimize=True,
         compress_level=6,
     )
-    return buffer.getvalue(), "image/png", "png"
+    return buf.getvalue(), "image/png", "png"
 
 
 def build_zip(files):
-    zip_buffer = io.BytesIO()
+    buf = io.BytesIO()
     with zipfile.ZipFile(
-        zip_buffer,
-        mode="w",
+        buf,
+        "w",
         compression=zipfile.ZIP_DEFLATED,
         compresslevel=6,
     ) as zf:
         for filename, data, _mime in files:
             zf.writestr(filename, data)
-    return zip_buffer.getvalue()
+    return buf.getvalue()
 
 
-def clear_previous_results():
-    for key in ("processed_previews", "zip_data", "zip_name", "last_settings"):
+def clear_results():
+    for key in (
+        "processed_previews",
+        "zip_data",
+        "zip_name",
+        "before_previews",
+    ):
         st.session_state.pop(key, None)
 
 
-st.title("🖼️ 画像分割・AI高画質化ツール v2")
+st.title("🖼️ 画像分割・人物高画質化ツール v3")
 st.caption(
-    "分割はそのまま、画質改善だけを本物のニューラル超解像に変更した版です。"
-    "外部の有料APIは使わず、Streamlit CloudのCPU上で処理します。"
+    "今回は『解像度を上げる』より、人物写真の肌がのっぺりしないことを優先。"
+    "顔を生成し直さず、元画像に残る微細な陰影・質感を見えやすくします。"
 )
 
 uploaded_file = st.file_uploader(
-    "分割したい画像をアップロード",
+    "画像をアップロード",
     type=["png", "jpg", "jpeg", "webp"],
     accept_multiple_files=False,
-    on_change=clear_previous_results,
+    on_change=clear_results,
 )
 
 left, right = st.columns([1, 1])
 
 with left:
-    preset_name = st.selectbox("分割レイアウト", list(PRESETS.keys()), index=2)
+    preset_name = st.selectbox(
+        "分割レイアウト",
+        list(PRESETS.keys()),
+        index=2,
+    )
 
     if preset_name == "カスタム":
         c1, c2 = st.columns(2)
@@ -287,74 +410,99 @@ with left:
 
     trim_px = st.slider(
         "区切り線を削る量",
-        min_value=0,
-        max_value=20,
-        value=2,
-        step=1,
-        help="白い区切り線が無い画像なら0でOKです。",
+        0, 20, 2, 1,
+        help="区切り線が無ければ0。",
     )
 
 with right:
-    quality_label = st.selectbox(
-        "画質改善",
-        list(QUALITY_MODES.keys()),
+    mode_label = st.selectbox(
+        "処理モード",
+        list(MODES.keys()),
         index=0,
     )
-    quality_mode = QUALITY_MODES[quality_label]
+    mode = MODES[mode_label]
 
-    finish_sharpen = st.checkbox(
-        "最後にごく弱いシャープ処理",
-        value=True,
-        help="強くしすぎない設定です。顔や肌がカリカリになるのを避けます。",
+    output_format = st.radio(
+        "出力形式",
+        ["PNG", "JPEG"],
+        horizontal=True,
+        index=0,
+        help="画質優先ならPNGがおすすめ。",
     )
 
-    output_format = st.radio("出力形式", ["JPEG", "PNG"], horizontal=True)
     jpeg_quality = 97
     if output_format == "JPEG":
         jpeg_quality = st.slider("JPEG品質", 90, 100, 97, 1)
 
-if quality_mode == "fsrcnn":
-    st.info(
-        "おすすめ設定：FSRCNN x2。モデルが非常に軽く、無料Streamlit Cloudで動かしやすい構成です。"
+st.subheader("人物・肌の質感")
+c1, c2, c3 = st.columns(3)
+
+with c1:
+    texture_strength = st.slider(
+        "微細ディテール",
+        0, 100, 45, 1,
+        help="上げすぎると肌がザラつくので35〜55程度がおすすめ。",
     )
-elif quality_mode == "edsr":
-    st.warning(
-        "EDSR x2はFSRCNNより重いです。初回のみ約37MBのモデル取得があり、"
-        "CPU処理なので8枚では時間がかかることがあります。"
+
+with c2:
+    skin_smoothness = st.slider(
+        "色ムラだけ軽く整える",
+        0, 30, 12, 1,
+        help="輝度の細かな凹凸は残し、色ノイズだけ弱く整えます。",
     )
+
+with c3:
+    local_contrast = st.slider(
+        "肌の立体感",
+        0, 40, 16, 1,
+        help="局所コントラスト。上げすぎると加工感が出ます。",
+    )
+
+st.info(
+    "最初は「微細ディテール45 / 色ムラ12 / 立体感16」がおすすめ。"
+    "肌が硬く見えたら微細ディテールを35前後まで下げてください。"
+)
 
 if uploaded_file is not None:
     image = open_uploaded_image(uploaded_file)
 
     st.subheader("元画像")
     st.write(
-        f"サイズ: **{image.width} × {image.height}px** / "
-        f"分割数: **{cols * rows}枚**"
+        f"**{image.width} × {image.height}px** / "
+        f"**{cols * rows}枚に分割**"
     )
     st.image(image, caption=uploaded_file.name)
 
-    if st.button("分割・AI高画質化する", type="primary", use_container_width=True):
+    if st.button(
+        "分割・人物高画質化する",
+        type="primary",
+        use_container_width=True,
+    ):
         stem = Path(uploaded_file.name).stem
-        pieces = split_image(image, cols=cols, rows=rows, trim_px=trim_px)
+        pieces = split_image(image, cols, rows, trim_px)
 
         files = []
         previews = []
+        before_previews = []
 
         status = st.empty()
         progress = st.progress(0)
         started = time.time()
 
         try:
-            if quality_mode in ("fsrcnn", "edsr"):
-                status.info("AI超解像モデルを準備しています…")
-                load_sr_model(quality_mode)
+            if mode in ("skin_edsr", "edsr"):
+                status.info("EDSRモデルを準備しています…")
+                load_edsr()
 
             for i, piece in enumerate(pieces, start=1):
                 status.info(f"{i}/{len(pieces)} 枚目を処理中…")
-                processed = enhance_image(
+
+                processed = process_piece(
                     piece,
-                    quality_mode,
-                    finish_sharpen=finish_sharpen,
+                    mode=mode,
+                    texture_strength=texture_strength,
+                    skin_smoothness=skin_smoothness,
+                    local_contrast=local_contrast,
                 )
 
                 data, mime, ext = image_to_bytes(
@@ -363,33 +511,64 @@ if uploaded_file is not None:
                     jpeg_quality=jpeg_quality,
                 )
 
+                before_data, before_mime, _ = image_to_bytes(
+                    piece,
+                    "PNG",
+                    jpeg_quality=100,
+                )
+
                 filename = f"{stem}_{i:02d}.{ext}"
                 files.append((filename, data, mime))
                 previews.append((filename, data, mime, processed.size))
+                before_previews.append(
+                    (f"元_{i:02d}", before_data, before_mime, piece.size)
+                )
 
                 progress.progress(i / len(pieces))
 
-            zip_data = build_zip(files)
-
             st.session_state["processed_previews"] = previews
-            st.session_state["zip_data"] = zip_data
-            st.session_state["zip_name"] = f"{stem}_split_ai_{len(files)}.zip"
-
-            elapsed = time.time() - started
-            status.success(f"完了しました（約 {elapsed:.1f} 秒）")
-
-        except Exception as exc:
-            status.error("AI高画質化でエラーが発生しました。")
-            st.exception(exc)
-            st.caption(
-                "もし無料Cloud側でAI処理が厳しい場合は、"
-                "「AI軽量・安定（FSRCNN x2）」を選んでください。"
+            st.session_state["before_previews"] = before_previews
+            st.session_state["zip_data"] = build_zip(files)
+            st.session_state["zip_name"] = (
+                f"{stem}_split_skin_{len(files)}.zip"
             )
 
-if "processed_previews" in st.session_state:
-    st.divider()
-    st.subheader("分割結果")
+            elapsed = time.time() - started
+            status.success(f"完了しました（約 {elapsed:.1f}秒）")
 
+        except Exception as exc:
+            status.error("処理中にエラーが発生しました。")
+            st.exception(exc)
+            st.caption(
+                "Community CloudでEDSRが重い場合は、"
+                "「人物・肌リアル（軽量 x2 / 高速）」に切り替えてください。"
+            )
+
+if (
+    "processed_previews" in st.session_state
+    and "before_previews" in st.session_state
+):
+    st.divider()
+    st.subheader("元画像と処理後の比較")
+
+    before = st.session_state["before_previews"]
+    after = st.session_state["processed_previews"]
+
+    # 最初の1枚を大きく比較
+    b_name, b_data, _, b_size = before[0]
+    a_name, a_data, _, a_size = after[0]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**分割直後**")
+        st.image(b_data)
+        st.caption(f"{b_size[0]} × {b_size[1]}px")
+    with c2:
+        st.markdown("**人物・肌高画質化後**")
+        st.image(a_data)
+        st.caption(f"{a_size[0]} × {a_size[1]}px")
+
+    st.subheader("全画像")
     previews = st.session_state["processed_previews"]
 
     for start in range(0, len(previews), 4):
@@ -399,13 +578,16 @@ if "processed_previews" in st.session_state:
         for column, item in zip(columns, row_items):
             filename, data, mime, size = item
             with column:
-                st.image(data, caption=f"{filename}\n{size[0]} × {size[1]}px")
+                st.image(
+                    data,
+                    caption=f"{filename}\n{size[0]} × {size[1]}px",
+                )
                 st.download_button(
                     "この画像を保存",
                     data=data,
                     file_name=filename,
                     mime=mime,
-                    key=f"download_{filename}",
+                    key=f"dl_{filename}",
                     use_container_width=True,
                 )
 
@@ -420,6 +602,6 @@ if "processed_previews" in st.session_state:
 
 st.divider()
 st.caption(
-    "AI軽量＝FSRCNN x2 / AI高品質＝EDSR x2。"
-    "どちらも画像全体を生成し直すGAN系ではなく、超解像向けのCNNモデルを使います。"
+    "このモードは顔パーツをAIで描き直すFace Restorationではありません。"
+    "元画像に残る輝度の微細成分を持ち上げ、色ノイズだけ弱く整える方向です。"
 )
